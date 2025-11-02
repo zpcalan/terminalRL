@@ -1,0 +1,85 @@
+{
+  "builder_name": "csv",
+  "citation": "",
+  "config_name": "default",
+  "dataset_size": 2345876,
+  "description": "",
+  "download_checksums": {
+    "/home/zpac-10969/workspace/terminalRL/dataset/latest_verified.csv": {
+      "num_bytes": 2377822,
+      "checksum": null
+    }
+  },
+  "download_size": 2377822,
+  "features": {
+    "task_id": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "difficulty": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "title": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "use_case_category": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "prompt": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "category": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "tags": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "dockerfile": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "test_functions": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "test_weights": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "additional_files": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "created_at": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "updated_at": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 4723698,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 2345876,
+      "num_examples": 331,
+      "dataset_name": "csv"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}

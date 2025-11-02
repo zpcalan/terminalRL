@@ -1390,7 +1390,7 @@
       "version": 2,
       "versionNonce": 84461238,
       "isDeleted": false,
-      "boundElements": null,
+      "boundElements": [],
       "updated": 1761884006958,
       "link": null,
       "locked": false,
@@ -1409,7 +1409,7 @@
     "gridSize": 20,
     "gridStep": 5,
     "gridModeEnabled": false,
-    "viewBackgroundColor": "#ffffff"
+    "viewBackgroundColor": "#fdf8f6"
   },
   "files": {}
 }

@@ -1,5 +1,11 @@
+import asyncio
 import os
 import sys
+import docker
+import os
+import time
+import tempfile
+import re
 from copy import deepcopy
 
 import torch.distributed as dist
@@ -7,7 +13,9 @@ from datasets import load_from_disk
 from areal.api.alloc_mode import AllocationMode
 from areal.api.cli_args import GRPOConfig, load_expr_config
 from areal.api.io_struct import FinetuneSpec, StepInfo, WeightUpdateMeta
-from areal.dataset import get_custom_dataset
+from areal.api.workflow_api import RolloutWorkflow
+from areal.api.reward_api import AsyncRewardWrapper
+from areal.experimental.openai import ArealOpenAI
 from areal.engine.ppo.actor import FSDPPPOActor
 from areal.engine.sglang_remote import RemoteSGLangEngine
 from areal.platforms import current_platform
@@ -24,11 +32,144 @@ from areal.utils.saver import Saver
 from areal.utils.stats_logger import StatsLogger
 from areal.workflow.rlvr import RLVRWorkflow
 
-def terminal_reward_fn(prompts, completions, prompt_ids, completion_ids, **kwargs):
-    return 0.1
+image_list = {}
+
+def create_image_and_run(index, docker_cmd, model_cmd, python_script):
+    global image_list
+    docker_client = docker.from_env()
+    image_name = f"image_{str(index)}"
+    has_image = False
+    try:
+        image = docker_client.images.get(image_name)
+        has_image = True
+    except docker.errors.ImageNotFound:
+        print(f"image for {image_name} not found")
+        has_image=False
+    if not has_image:
+        temp_dir = tempfile.mkdtemp()
+        dockerfile_path = os.path.join(temp_dir, "Dockerfile")
+        with open(dockerfile_path, 'w') as f:
+            f.write(docker_cmd)
+            
+        image_name = f"image_{str(index)}"
+        image, build_logs = docker_client.images.build(path=temp_dir, tag=image_name, rm=True)
+        print(f"build image for docker file {docker_cmd} log: {build_logs}")
+        image_list.append(image_name)
+
+    try:
+        container = docker_client.containers.run(
+                image_name,
+                command= model_cmd,
+                detach=False,
+                stdout=True,
+                stderr=True,
+                remove=True
+            )
+    except docker.errors.ContainerError as e:
+        print(f"ERROR: {str(e)}")
+    logs = container.decode('utf-8')
+    print(f"{model_cmd}logs are {logs}")
+    return logs
+
+def terminal_reward_fn(index, result, docker_cmd, test_weights, python_script):
+    # Extract command lines from the completion.
+    pattern = r'<cmd>(.*?)</cmd>'
+    matches = re.findall(pattern, result, re.DOTALL)
+    result = create_image_and_run(index, docker_cmd, matches[0], python_script)
+
+    # TODO: Consider test_weights to construct smooth reward output.
+    if "success".lower() in result.lower():
+        return 1, result
+    else:
+        return 0, result
 
 def extract_prompt_fn(data):
     return data["prompt"]
+
+class TerminalAgent:
+    def __init__(
+        self,
+        tokenizer,
+        max_turns,
+    ):
+        self.tokenizer = tokenizer
+        self.max_turns = max_turns
+        self.async_reward_fn = AsyncRewardWrapper(terminal_reward_fn)
+
+    async def run_agent(self, data, client):
+        sys_prompt = "You're a terminal command assistant and you must response with correct command within '<cmd>' and '</cmd>' tag"
+        messages = sys_prompt + ":" + data["prompt"].copy()
+        num_turns_left = self.max_turns
+        completions = []
+        index = data["task_id"]
+        while num_turns_left > 0:
+            response = await client.chat.completions.create(
+                messages=messages,
+                temperature=1.0,
+                max_completion_tokens=32768,
+            )
+            completions.append(response)
+            content = response.choices[0].message.content
+            messages.append({"role": "assistant", "content": content})
+            # Get the reward composition and stdout from docker container.
+            reward, stdout = await self.async_reward_fn(index, content, data["dockerfile"], data["test_weights"], data["test_functions"])
+            client.set_reward(response.id, reward)
+            if reward == 0:
+                print(f"This turn's answer is invalid, stop this trajectory collection.")
+                break
+            else:
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": "Your last command output is " + stdout,
+                    }
+                )
+            num_turns_left -= 1
+        return reward
+
+
+class TerminalMultiturnRLVRWorkflow(RolloutWorkflow):
+    def __init__(
+        self,
+        tokenizer,
+        n_trajs,
+        max_turns,
+    ):
+        self.tokenizer = tokenizer
+        self.max_turns = max_turns
+        self.n_trajs = n_trajs
+        self.agent = TerminalAgent(
+            tokenizer=tokenizer,
+            max_turns=max_turns
+        )
+
+    async def arun_episode(self, engine, data):
+        clients = [
+            ArealOpenAI(engine=engine, tokenizer=self.tokenizer)
+            for _ in range(self.n_trajs)
+        ]
+
+        # Collect trajectories
+        rewards = await asyncio.gather(
+            *[
+                self.agent.run_agent(
+                    data=data,
+                    client=clients[i],
+                )
+                for i in range(self.n_trajs)
+            ]
+        )
+        for reward in rewards:
+            stats_tracker.get("rollout").scalar(reward=reward)
+
+        completions_with_reward = {}
+        for client in clients:
+            client.apply_reward_discount(turn_discount=0.9)
+            completions = client.export_completions(style="individual")
+            completions_with_reward.update(completions)
+            print(f"client completions is{completions}")
+        return completions_with_reward
+
 
 def main(args):
     config, _ = load_expr_config(args, GRPOConfig)
@@ -48,13 +189,7 @@ def main(args):
 
     # Create dataset and dataloaders
     train_dataset = load_from_disk(dataset_path=config.train_dataset.path + '/train')
-    get_custom_dataset(
-        split="train", dataset_config=config.train_dataset, tokenizer=tokenizer
-    )
-    valid_dataset = load_from_disk(dataset_path=config.valid_dataset.path + '/train')
-    get_custom_dataset(
-        split="test", dataset_config=config.valid_dataset, tokenizer=tokenizer
-    )
+    valid_dataset = load_from_disk(dataset_path=config.valid_dataset.path + '/test')
 
     train_dataloader = create_dataloader(
         train_dataset,
@@ -98,27 +233,25 @@ def main(args):
         config.gconfig.stop_token_ids.append(tokenizer.pad_token_id)
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
-    workflow = RLVRWorkflow(
-        reward_fn=gsm8k_reward_fn,
-        gconfig=config.gconfig,
+
+    # Need to check return value of RLVRWorkflow.arun_episode
+    # workflow = RLVRWorkflow(
+    #     reward_fn=terminal_reward_fn,
+    #     gconfig=config.gconfig,
+    #     tokenizer=tokenizer,
+    #     enable_thinking=False,
+    #     dump_dir=os.path.join(
+    #         StatsLogger.get_log_path(config.stats_logger), "generated"
+    #     ),
+    #     data_extract_prompt_fn=extract_prompt_fn
+    # )
+
+    workflow = TerminalMultiturnRLVRWorkflow(
         tokenizer=tokenizer,
-        enable_thinking=False,
-        dump_dir=os.path.join(
-            StatsLogger.get_log_path(config.stats_logger), "generated"
-        ),
-        data_extract_prompt_fn=extract_prompt_fn
+        n_trajs=2,
+        max_turns=8,
     )
-    eval_workflow = RLVRWorkflow(
-        reward_fn=gsm8k_reward_fn,
-        gconfig=config.gconfig.new(temperature=0.6),
-        tokenizer=tokenizer,
-        enable_thinking=False,
-        rollout_stat_scope="eval-rollout",
-        dump_dir=os.path.join(
-            StatsLogger.get_log_path(config.stats_logger), "generated-eval"
-        ),
-        data_extract_prompt_fn=extract_prompt_fn
-    )
+
 
     # Run training.
     saver = Saver(config.saver, ft_spec)
@@ -221,26 +354,6 @@ def main(args):
 
         dist.barrier(device_ids=[actor.device.index])
         current_platform.synchronize()
-
-        with stats_tracker.record_timing("eval"):
-
-            def evaluate_fn():
-                if actor.is_data_parallel_head():
-                    cnt = 0
-                    for data in valid_dataloader:
-                        for item in data:
-                            eval_rollout.submit(item, eval_workflow)
-                            cnt += 1
-                    eval_rollout.wait(cnt, timeout=None)
-                dist.barrier(device_ids=[actor.device.index])
-                current_platform.synchronize()
-
-            evaluator.evaluate(
-                evaluate_fn,
-                epoch,
-                step,
-                global_step,
-            )
 
         dist.barrier(device_ids=[actor.device.index])
         current_platform.synchronize()
