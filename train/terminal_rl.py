@@ -34,7 +34,7 @@ from areal.workflow.rlvr import RLVRWorkflow
 
 image_list = {}
 
-def create_image_and_run(index, docker_cmd, model_cmd, python_script):
+def create_image_and_run(index, docker_cmd, model_cmd, python_script_path):
     global image_list
     docker_client = docker.from_env()
     image_name = f"image_{str(index)}"
@@ -55,7 +55,7 @@ def create_image_and_run(index, docker_cmd, model_cmd, python_script):
         image, build_logs = docker_client.images.build(path=temp_dir, tag=image_name, rm=True)
         print(f"build image for docker file {docker_cmd} log: {build_logs}")
         image_list.append(image_name)
-
+    print(f"Run model_cmd {model_cmd}")
     try:
         container = docker_client.containers.run(
                 image_name,
@@ -69,16 +69,47 @@ def create_image_and_run(index, docker_cmd, model_cmd, python_script):
         print(f"ERROR: {str(e)}")
     logs = container.decode('utf-8')
     print(f"{model_cmd}logs are {logs}")
-    return logs
+    
+    # Run python file to verify result.
+    # TODO: Some containers may not have python and pytest installed.
+    python_case_pass = False
+    python_cmd = "pytest -s " + '/home/zpc/ant/terminalRL/train/' + python_script_path
+    try:
+        python_output = docker_client.containers.run(
+                    image_name,
+                    command= python_cmd,
+                    detach=False,
+                    stdout=True,
+                    stderr=True,
+                    remove=True,
+                    volumes={
+                        '/home/zpc/ant/terminalRL/train': {
+                            'bind': '/home/zpc/ant/terminalRL/train',
+                            'mode': 'rw'
+                        }
+                    }
+                )
+        python_case_pass = True
+    except Exception as e:
+        print(f"ERROR: execute python script failed: {str(e)}")
+    return logs, python_case_pass
 
 def terminal_reward_fn(index, result, docker_cmd, test_weights, python_script):
     # Extract command lines from the completion.
+    print(f"====result for {index} is {result}")
     pattern = r'<cmd>(.*?)</cmd>'
     matches = re.findall(pattern, result, re.DOTALL)
-    result = create_image_and_run(index, docker_cmd, matches[0], python_script)
+    if matches:
+        # Create Python script to verify the result.
+        with open("test_"+index+".py", "w") as f:
+            f.write(python_script)
+        result, test_case_result = create_image_and_run(index, docker_cmd, matches[0], "test_"+index+".py")
+    else:
+        result = "FAILED"
+        test_case_result = False
 
     # TODO: Consider test_weights to construct smooth reward output.
-    if "success".lower() in result.lower():
+    if test_case_result:
         return 1, result
     else:
         return 0, result
@@ -94,11 +125,12 @@ class TerminalAgent:
     ):
         self.tokenizer = tokenizer
         self.max_turns = max_turns
-        self.async_reward_fn = AsyncRewardWrapper(terminal_reward_fn)
+        # self.async_reward_fn = AsyncRewardWrapper(terminal_reward_fn)
 
     async def run_agent(self, data, client):
         sys_prompt = "You're a terminal command assistant and you must response with correct command within '<cmd>' and '</cmd>' tag"
-        messages = sys_prompt + ":" + data["prompt"].copy()
+        messages = []
+        messages.append({"role": "user", "content": sys_prompt + ":" + data["prompt"][:1024]})
         num_turns_left = self.max_turns
         completions = []
         index = data["task_id"]
@@ -106,16 +138,16 @@ class TerminalAgent:
             response = await client.chat.completions.create(
                 messages=messages,
                 temperature=1.0,
-                max_completion_tokens=32768,
+                max_completion_tokens=4096,
             )
             completions.append(response)
             content = response.choices[0].message.content
             messages.append({"role": "assistant", "content": content})
             # Get the reward composition and stdout from docker container.
-            reward, stdout = await self.async_reward_fn(index, content, data["dockerfile"], data["test_weights"], data["test_functions"])
+            reward, stdout = terminal_reward_fn(index, content, data["dockerfile"], data["test_weights"], data["test_functions"])
             client.set_reward(response.id, reward)
             if reward == 0:
-                print(f"This turn's answer is invalid, stop this trajectory collection.")
+                print(f"This turn's answer is invalid {index}, stop this trajectory collection.")
                 break
             else:
                 messages.append(
@@ -167,7 +199,7 @@ class TerminalMultiturnRLVRWorkflow(RolloutWorkflow):
             client.apply_reward_discount(turn_discount=0.9)
             completions = client.export_completions(style="individual")
             completions_with_reward.update(completions)
-            print(f"client completions is{completions}")
+            # print(f"client completions is{completions}")
         return completions_with_reward
 
 
@@ -234,24 +266,11 @@ def main(args):
     if tokenizer.eos_token_id not in config.gconfig.stop_token_ids:
         config.gconfig.stop_token_ids.append(tokenizer.eos_token_id)
 
-    # Need to check return value of RLVRWorkflow.arun_episode
-    # workflow = RLVRWorkflow(
-    #     reward_fn=terminal_reward_fn,
-    #     gconfig=config.gconfig,
-    #     tokenizer=tokenizer,
-    #     enable_thinking=False,
-    #     dump_dir=os.path.join(
-    #         StatsLogger.get_log_path(config.stats_logger), "generated"
-    #     ),
-    #     data_extract_prompt_fn=extract_prompt_fn
-    # )
-
     workflow = TerminalMultiturnRLVRWorkflow(
         tokenizer=tokenizer,
         n_trajs=2,
-        max_turns=8,
+        max_turns=2,
     )
-
 
     # Run training.
     saver = Saver(config.saver, ft_spec)
